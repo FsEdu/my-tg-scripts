@@ -5,11 +5,11 @@ export PATH
 #=================================================
 #	System Required: Alpine/CentOS/Debian/Ubuntu
 #	Description: MTProxy Golang (v2.1.7 Stable)
-#	Version: 2.4.0-Absolute
+#	Version: 2.5.0-Hardcoded
 #	Modified by: Gemini AI
 #=================================================
 
-sh_ver="2.4.0-Absolute"
+sh_ver="2.5.0-Hardcoded"
 file="/usr/local/mtproxy-go"
 mtproxy_file="${file}/mtg"
 mtproxy_conf="${file}/mtproxy.conf"
@@ -90,53 +90,74 @@ Download(){
     
     download_url="https://github.com/9seconds/mtg/releases/download/v${version}/${filename}"
     
-    # 强制清理旧文件，确保绝对干净
-    rm -f mtg ${filename}
-    
-    wget --no-check-certificate -O ${filename} "${download_url}"
-    
-    if [[ ! -e "${filename}" ]]; then
-        echo -e "${Error} 下载失败，文件不存在！"
-        exit 1
-    fi
-    
-    echo -e "${Info} 下载成功，正在解压..."
-    tar -xzf ${filename} --strip-components=1
-    
-    # 容错查找
-    if [[ ! -e "mtg" ]]; then
-        find . -name "mtg" -type f -exec mv {} . \;
+    # 检测是否需要重新下载 (如果文件大小不对或不存在)
+    need_download=true
+    if [[ -e "mtg" ]]; then
+        # 简单检查一下现有的 mtg 能不能跑
+        ./mtg --version >/dev/null 2>&1
+        if [[ $? -eq 0 ]]; then
+            echo -e "${Info} 检测到 mtg 文件已存在且可运行，跳过下载。"
+            need_download=false
+        else
+            echo -e "${Tip} 现有的 mtg 文件损坏或架构不符，重新下载..."
+            rm -f mtg
+        fi
     fi
 
-    if [[ ! -e "mtg" ]]; then
-        echo -e "${Error} 解压失败，未找到 mtg 二进制文件！"
-        exit 1
+    if [[ "$need_download" = true ]]; then
+        rm -f ${filename}
+        wget --no-check-certificate -O ${filename} "${download_url}"
+        
+        if [[ ! -e "${filename}" ]]; then
+            echo -e "${Error} 下载失败，文件不存在！"
+            exit 1
+        fi
+        
+        filesize=$(stat -c%s "${filename}" 2>/dev/null || wc -c <"${filename}")
+        if [[ $filesize -lt 1048576 ]]; then
+            echo -e "${Error} 下载文件过小 (${filesize} bytes)，可能是下载链接失效。"
+            rm -f ${filename}
+            exit 1
+        fi
+
+        echo -e "${Info} 下载成功，正在解压..."
+        tar -xzf ${filename} --strip-components=1
+        
+        if [[ ! -e "mtg" ]]; then
+            find . -name "mtg" -type f -exec mv {} . \;
+        fi
+
+        if [[ ! -e "mtg" ]]; then
+            echo -e "${Error} 解压失败，未找到 mtg 二进制文件！"
+            exit 1
+        fi
+        
+        chmod +x mtg
+        rm -f ${filename} LICENSE README.md
+        echo -e "${Info} MTProxy 主程序安装成功！"
     fi
-    
-    chmod +x mtg
-    rm -f ${filename} LICENSE README.md
-    echo -e "${Info} MTProxy 主程序安装成功！"
 }
 
-# 生成启动脚本
+# 生成启动脚本 - 核心修改：硬编码参数
 Generate_Run_Script(){
-    # 使用 /usr/bin/env bash 提高兼容性
+    # 确保参数存在
+    if [[ -z "${mtp_port}" || -z "${mtp_passwd}" ]]; then
+        echo -e "${Error} 严重错误：生成启动脚本时参数丢失！"
+        exit 1
+    fi
+
+    # 直接将具体的端口和密码写入文件，不使用变量引用
     cat > ${mtproxy_run} <<EOF
 #!/usr/bin/env bash
-source ${mtproxy_conf}
-
-# 日志记录
 echo "--- Session Start: \$(date) ---" > ${mtproxy_log}
-echo "Starting MTProxy on port \${PORT}..." >> ${mtproxy_log}
 
-# 核心修正：判断密码是否为空
-if [[ -z "\${PASSWORD}" ]]; then
-    echo "Error: PASSWORD is empty in config!" >> ${mtproxy_log}
-    exit 1
-fi
+# Debug info
+echo "Executing binary with hardcoded params..." >> ${mtproxy_log}
 
-# 启动命令
-exec ${mtproxy_file} simple-run -b 0.0.0.0:\${PORT} "\${PASSWORD}" >> ${mtproxy_log} 2>&1
+# 启动命令 (Hardcoded)
+# Port: ${mtp_port}
+# Secret: ${mtp_passwd}
+exec ${mtproxy_file} simple-run -b 0.0.0.0:${mtp_port} ${mtp_passwd} >> ${mtproxy_log} 2>&1
 EOF
     chmod +x ${mtproxy_run}
 }
@@ -185,7 +206,7 @@ EOF
     fi
 }
 
-# 写入配置
+# 写入配置 (仅用于 View 查看，不用于运行)
 Write_config(){
 	cat > ${mtproxy_conf}<<EOF
 PORT="${mtp_port}"
@@ -215,16 +236,14 @@ Set_passwd(){
     # 尝试方法 1：使用 mtg 生成
     mtp_passwd=$(${mtproxy_file} generate-secret --hex ${fake_domain} 2>/dev/null)
     
-    # 尝试方法 2：如果 mtg 失败（返回空），手动生成（双重保险）
+    # 尝试方法 2：手动生成（双重保险）
     if [[ -z "${mtp_passwd}" ]]; then
         echo -e "${Tip} 二进制生成密钥失败，尝试备用方案..."
-        # 手动构造：ee + 32位随机hex + 域名hex
         random_hex=$(openssl rand -hex 16)
         domain_hex=$(echo -n "${fake_domain}" | xxd -p | tr -d '\n')
         mtp_passwd="ee${random_hex}${domain_hex}"
     fi
     
-    # 最终检查
     if [[ -z "${mtp_passwd}" ]]; then
         echo -e "${Error} 密钥生成彻底失败，请检查系统环境！"
         exit 1
@@ -270,6 +289,9 @@ Start(){
         echo -e "================ 日志开始 ================"
         cat ${mtproxy_log}
         echo -e "================ 日志结束 ================"
+        echo -e "${Tip} 如果日志显示 'bind: address already in use'，请换个端口重装。"
+        echo -e "${Tip} 正在检查生成的启动脚本内容 (用于调试):"
+        cat ${mtproxy_run}
     fi
 }
 
@@ -286,11 +308,10 @@ Stop(){
 
 View(){
     Read_config
-    # 获取公网IP
     public_ip=$(curl -s4 ip.sb || wget -qO- -4 ip.sb)
     
     clear
-    echo -e "MTProxy v2 配置信息："
+    echo -e "MTProxy v2 配置信息 (硬编码模式)："
     echo -e "————————————————"
     echo -e "地址\t: ${Green_font_prefix}${public_ip}${Font_color_suffix}"
     echo -e "端口\t: ${Green_font_prefix}${mtp_port}${Font_color_suffix}"
@@ -314,7 +335,7 @@ Uninstall(){
 }
 
 # 菜单
-echo && echo -e "  MTProxy-Go 终极版 (V2.4.0)
+echo && echo -e "  MTProxy-Go 硬核修复版 (V2.5.0)
   
   1. 安装 (Install)
   2. 卸载 (Uninstall)
