@@ -5,11 +5,11 @@ export PATH
 #=================================================
 #	System Required: Alpine/CentOS/Debian/Ubuntu
 #	Description: MTProxy Golang (v2.1.7 Stable)
-#	Version: 2.3.0-FinalFix
+#	Version: 2.4.0-Absolute
 #	Modified by: Gemini AI
 #=================================================
 
-sh_ver="2.3.0-FinalFix"
+sh_ver="2.4.0-Absolute"
 file="/usr/local/mtproxy-go"
 mtproxy_file="${file}/mtg"
 mtproxy_conf="${file}/mtproxy.conf"
@@ -48,7 +48,6 @@ check_installed_status(){
 }
 
 check_pid(){
-	# 匹配 simple-run 关键字
 	PID=$(ps -ef | grep "mtg simple-run" | grep -v "grep" | awk '{print $2}')
 }
 
@@ -56,10 +55,11 @@ check_pid(){
 Download(){
 	echo -e "${Info} 正在为 ${release} 系统安装依赖..."
     
+    # 强制安装 xxd 和 openssl 用于备用密码生成
     if [[ "${release}" == "alpine" ]]; then
-        ${install_cmd} wget bash ca-certificates curl tar
+        ${install_cmd} wget bash ca-certificates curl tar xxd openssl
     else
-        ${install_cmd} wget ca-certificates curl tar
+        ${install_cmd} wget ca-certificates curl tar vim-common openssl
     fi
 
 	if [[ ! -e "${file}" ]]; then
@@ -90,57 +90,52 @@ Download(){
     
     download_url="https://github.com/9seconds/mtg/releases/download/v${version}/${filename}"
     
-    # 只有当文件不存在时才下载，避免重复下载
-    if [[ ! -e "mtg" ]]; then
-        rm -f ${filename}
-        wget --no-check-certificate -O ${filename} "${download_url}"
-        
-        if [[ ! -e "${filename}" ]]; then
-            echo -e "${Error} 下载失败，文件不存在！"
-            exit 1
-        fi
-
-        filesize=$(stat -c%s "${filename}" 2>/dev/null || wc -c <"${filename}")
-        if [[ $filesize -lt 1048576 ]]; then
-            echo -e "${Error} 下载文件过小 (${filesize} bytes)，可能是下载链接失效。"
-            rm -f ${filename}
-            exit 1
-        fi
-        
-        echo -e "${Info} 下载成功，正在解压..."
-        tar -xzf ${filename} --strip-components=1
-        
-        # 容错查找
-        if [[ ! -e "mtg" ]]; then
-            find . -name "mtg" -type f -exec mv {} . \;
-        fi
-
-        if [[ ! -e "mtg" ]]; then
-            echo -e "${Error} 解压失败，未找到 mtg 二进制文件！"
-            exit 1
-        fi
-        
-        chmod +x mtg
-        rm -f ${filename} LICENSE README.md
-        echo -e "${Info} MTProxy 主程序安装成功！"
-    else
-        echo -e "${Info} 检测到 mtg 文件已存在，跳过下载。"
+    # 强制清理旧文件，确保绝对干净
+    rm -f mtg ${filename}
+    
+    wget --no-check-certificate -O ${filename} "${download_url}"
+    
+    if [[ ! -e "${filename}" ]]; then
+        echo -e "${Error} 下载失败，文件不存在！"
+        exit 1
     fi
+    
+    echo -e "${Info} 下载成功，正在解压..."
+    tar -xzf ${filename} --strip-components=1
+    
+    # 容错查找
+    if [[ ! -e "mtg" ]]; then
+        find . -name "mtg" -type f -exec mv {} . \;
+    fi
+
+    if [[ ! -e "mtg" ]]; then
+        echo -e "${Error} 解压失败，未找到 mtg 二进制文件！"
+        exit 1
+    fi
+    
+    chmod +x mtg
+    rm -f ${filename} LICENSE README.md
+    echo -e "${Info} MTProxy 主程序安装成功！"
 }
 
-# 生成启动脚本 (修复 CMD 变量解析问题)
+# 生成启动脚本
 Generate_Run_Script(){
+    # 使用 /usr/bin/env bash 提高兼容性
     cat > ${mtproxy_run} <<EOF
-#!/bin/bash
+#!/usr/bin/env bash
 source ${mtproxy_conf}
 
-# 强制清空日志，防止看到旧错误
-echo "--- New Session ---" > ${mtproxy_log}
+# 日志记录
+echo "--- Session Start: \$(date) ---" > ${mtproxy_log}
+echo "Starting MTProxy on port \${PORT}..." >> ${mtproxy_log}
 
-# 直接构建并执行命令，不使用变量拼接，防止 Alpine 解析错误
-# 使用 simple-run 模式，绑定 0.0.0.0 确保 NAT 转发正常
-echo "Executing: ${mtproxy_file} simple-run -b 0.0.0.0:\${PORT} [SECRET_HIDDEN]" >> ${mtproxy_log}
+# 核心修正：判断密码是否为空
+if [[ -z "\${PASSWORD}" ]]; then
+    echo "Error: PASSWORD is empty in config!" >> ${mtproxy_log}
+    exit 1
+fi
 
+# 启动命令
 exec ${mtproxy_file} simple-run -b 0.0.0.0:\${PORT} "\${PASSWORD}" >> ${mtproxy_log} 2>&1
 EOF
     chmod +x ${mtproxy_run}
@@ -152,7 +147,6 @@ Service(){
 
     if [[ "${release}" == "alpine" ]]; then
         echo -e "${Info} 安装 OpenRC 服务..."
-        # 确保 OpenRC 脚本正确指向 bash 启动器
         cat > /etc/init.d/mtproxy-go <<EOF
 #!/sbin/openrc-run
 name="mtproxy-go"
@@ -217,7 +211,26 @@ Set_passwd(){
     [[ -z "${fake_domain}" ]] && fake_domain="itunes.apple.com"
     
     echo -e "${Info} 正在生成密钥..."
-    mtp_passwd=$(${mtproxy_file} generate-secret --hex ${fake_domain})
+    
+    # 尝试方法 1：使用 mtg 生成
+    mtp_passwd=$(${mtproxy_file} generate-secret --hex ${fake_domain} 2>/dev/null)
+    
+    # 尝试方法 2：如果 mtg 失败（返回空），手动生成（双重保险）
+    if [[ -z "${mtp_passwd}" ]]; then
+        echo -e "${Tip} 二进制生成密钥失败，尝试备用方案..."
+        # 手动构造：ee + 32位随机hex + 域名hex
+        random_hex=$(openssl rand -hex 16)
+        domain_hex=$(echo -n "${fake_domain}" | xxd -p | tr -d '\n')
+        mtp_passwd="ee${random_hex}${domain_hex}"
+    fi
+    
+    # 最终检查
+    if [[ -z "${mtp_passwd}" ]]; then
+        echo -e "${Error} 密钥生成彻底失败，请检查系统环境！"
+        exit 1
+    fi
+    
+    echo -e "${Info} 密钥生成成功: ${mtp_passwd:0:10}..."
     mtp_tls="YES"
 }
 
@@ -301,7 +314,7 @@ Uninstall(){
 }
 
 # 菜单
-echo && echo -e "  MTProxy-Go 终极修复版 (V2.3.0)
+echo && echo -e "  MTProxy-Go 终极版 (V2.4.0)
   
   1. 安装 (Install)
   2. 卸载 (Uninstall)
