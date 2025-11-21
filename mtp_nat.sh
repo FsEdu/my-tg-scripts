@@ -1,3 +1,4 @@
+cat > mtp_nat.sh << 'EOF'
 #!/usr/bin/env bash
 PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
@@ -63,20 +64,10 @@ install_deps() {
   eval "$PKG_UPDATE" >/dev/null 2>&1 || warn "更新软件源失败，继续尝试安装依赖。"
 
   info "安装依赖：curl wget tar ca-certificates..."
-  case "$OS" in
-    debian|centos)
-      eval "$PKG_INSTALL curl wget tar ca-certificates" || {
-        error "安装依赖失败，请检查网络和软件源。"
-        exit 1
-      }
-      ;;
-    alpine)
-      eval "$PKG_INSTALL curl wget tar ca-certificates" || {
-        error "安装依赖失败，请检查网络和软件源。"
-        exit 1
-      }
-      ;;
-  esac
+  eval "$PKG_INSTALL curl wget tar ca-certificates" || {
+    error "安装依赖失败，请检查网络和软件源。"
+    exit 1
+  }
 }
 
 detect_arch() {
@@ -175,9 +166,9 @@ config_mtg() {
   [ -z "$port" ] && port="8443"
 
   info "生成 FakeTLS secret..."
-  # mtg v2 推荐的 FakeTLS 生成方式，输出以 ee 开头
+  # mtg v2 FakeTLS：--hex，secret 以 ee 开头
   local secret
-  secret=$("$MTG_BIN" generate-secret --hex "$domain")
+  secret=$("$MTG_BIN" generate-secret --hex "$domain" 2>/dev/null)
   if [ -z "$secret" ]; then
     error "生成 secret 失败，请检查 mtg 是否工作正常。"
     exit 1
@@ -267,6 +258,11 @@ uninstall_mtg() {
 }
 
 restart_mtg() {
+  if ! [ -f "$MTG_CONF" ] || ! [ -x "$MTG_BIN" ]; then
+    error "未检测到已安装的 mtg。"
+    exit 1
+  fi
+
   if command -v systemctl >/dev/null 2>&1; then
     systemctl restart mtg 2>/dev/null || {
       error "systemd 重启失败，请检查日志。"
@@ -275,8 +271,21 @@ restart_mtg() {
     info "已通过 systemd 重启 mtg 服务。"
   else
     warn "系统没有 systemd，请手动重启，例如："
-    echo "  killall mtg  # 结束旧进程"
+    echo "  killall mtg  # 结束旧进程（如果有）"
     echo "  $MTG_BIN run $MTG_CONF &"
+  fi
+}
+
+view_log() {
+  if command -v systemctl >/dev/null 2>&1; then
+    echo
+    warn "显示最近 200 行日志（完整日志可用：journalctl -u mtg -e）"
+    echo
+    journalctl -u mtg -e --no-pager | tail -n 200
+    echo
+    warn "持续跟踪请执行：journalctl -u mtg -f"
+  else
+    warn "当前系统没有 systemd，日志就是你手动运行 mtg 时终端里的输出。"
   fi
 }
 
@@ -299,13 +308,58 @@ show_help() {
   install    安装并配置 mtg（推荐）
   info       显示当前连接信息（tg:// 链接等）
   restart    重启 mtg 服务
+  log        查看运行日志（systemd）
   uninstall  卸载 mtg 及配置/服务
   help       显示本帮助
 
-示例：
-  bash $(basename "$0") install
-  bash $(basename "$0") info
+不加参数直接运行，会进入交互式菜单。
 EOF
+}
+
+show_menu() {
+  while true; do
+    clear
+    echo -e "  ${green}MTG NAT 一键脚本${plain}"
+    echo "  ----------------------------"
+    echo -e "  ${green}1.${plain} 安装 / 重新安装 mtg"
+    echo -e "  ${green}2.${plain} 查看账号信息"
+    echo -e "  ${green}3.${plain} 重启服务"
+    echo -e "  ${green}4.${plain} 查看运行日志"
+    echo -e "  ${green}5.${plain} 卸载 mtg"
+    echo -e "  ${green}0.${plain} 退出"
+    echo
+    read -rp "  请输入数字 [0-5]: " choice
+
+    case "$choice" in
+      1)
+        install_all
+        read -rp "按回车键返回菜单..." _
+        ;;
+      2)
+        show_info
+        read -rp "按回车键返回菜单..." _
+        ;;
+      3)
+        restart_mtg
+        read -rp "按回车键返回菜单..." _
+        ;;
+      4)
+        view_log
+        read -rp "按回车键返回菜单..." _
+        ;;
+      5)
+        uninstall_mtg
+        read -rp "按回车键返回菜单..." _
+        ;;
+      0)
+        exit 0
+        ;;
+      *)
+        echo "  无效输入。"
+        sleep 1
+        ;;
+    esac
+  done
 }
 
 main() {
@@ -319,11 +373,17 @@ main() {
     restart)
       restart_mtg
       ;;
+    log)
+      view_log
+      ;;
     uninstall)
       uninstall_mtg
       ;;
-    help|"")
+    help)
       show_help
+      ;;
+    "")
+      show_menu
       ;;
     *)
       error "未知命令：$1"
@@ -334,3 +394,6 @@ main() {
 }
 
 main "$@"
+EOF
+
+chmod +x mtp_nat.sh
