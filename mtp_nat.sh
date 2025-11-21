@@ -2,7 +2,6 @@
 PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 
-# 颜色
 red='\033[0;31m'
 green='\033[0;32m'
 yellow='\033[0;33m'
@@ -11,6 +10,11 @@ plain='\033[0m'
 MTG_BIN="/usr/local/bin/mtg"
 MTG_CONF="/usr/local/etc/mtg.toml"
 MTG_SERVICE="/etc/systemd/system/mtg.service"
+
+# 旧 Toyo 脚本的安装位置
+OLD_MTP_DIR="/usr/local/mtproxy-go"
+OLD_MTP_BIN="$OLD_MTP_DIR/mtg"
+OLD_MTP_INIT="/etc/init.d/mtproxy-go"
 
 info()  { echo -e "[${green}信息${plain}] $*"; }
 warn()  { echo -e "[${yellow}提示${plain}] $*"; }
@@ -55,7 +59,6 @@ detect_os() {
     PKG_UPDATE="apt-get update -y"
     PKG_INSTALL="apt-get install -y"
   fi
-  info "检测到系统类型：$OS"
 }
 
 install_deps() {
@@ -87,7 +90,6 @@ detect_arch() {
       exit 1
       ;;
   esac
-  info "检测到架构：$ARCH"
 }
 
 download_mtg() {
@@ -132,7 +134,6 @@ download_mtg() {
     exit 1
   fi
 
-  # 解压后目录名一般是 mtg-${ver}-linux-${ARCH}
   local dir
   dir=$(find . -maxdepth 1 -type d -name "mtg-*-linux-*")
   if [ ! -x "$dir/mtg" ]; then
@@ -165,7 +166,6 @@ config_mtg() {
   [ -z "$port" ] && port="8443"
 
   info "生成 FakeTLS secret..."
-  # mtg v2 FakeTLS：--hex，secret 以 ee 开头
   local secret
   secret=$("$MTG_BIN" generate-secret --hex "$domain" 2>/dev/null)
   if [ -z "$secret" ]; then
@@ -174,7 +174,7 @@ config_mtg() {
   fi
 
   cat > "$MTG_CONF" <<EOF
-# mtg 配置文件，至少需要 secret 和 bind-to 两项
+# mtg 配置文件
 # FakeTLS 域名: $domain
 secret = "$secret"
 bind-to = "0.0.0.0:$port"
@@ -218,7 +218,7 @@ EOF
 show_info() {
   if [ ! -f "$MTG_CONF" ] || [ ! -x "$MTG_BIN" ]; then
     error "未检测到已安装的 mtg（$MTG_BIN / $MTG_CONF）。"
-    exit 1
+    return 1
   fi
 
   local port secret
@@ -244,6 +244,8 @@ show_info() {
 }
 
 uninstall_mtg() {
+  warn "开始卸载通过本脚本安装的 mtg..."
+
   if command -v systemctl >/dev/null 2>&1; then
     systemctl stop mtg 2>/dev/null || true
     systemctl disable mtg 2>/dev/null || true
@@ -251,40 +253,68 @@ uninstall_mtg() {
 
   rm -f "$MTG_BIN" "$MTG_CONF" "$MTG_SERVICE"
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload
+    systemctl daemon-reload 2>/dev/null || true
   fi
-  info "已卸载 mtg 和相关配置/服务文件。"
+
+  info "已卸载 mtg 和相关配置/服务文件（如果存在的话）。"
+}
+
+uninstall_old_mtproxy() {
+  if [ ! -x "$OLD_MTP_BIN" ] && [ ! -f "$OLD_MTP_INIT" ]; then
+    warn "未检测到旧版 mtproxy-go 安装目录或脚本（/usr/local/mtproxy-go / /etc/init.d/mtproxy-go）。"
+    return 0
+  fi
+
+  warn "准备卸载旧版 Toyo mtproxy-go..."
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop mtproxy-go 2>/dev/null || true
+    systemctl disable mtproxy-go 2>/dev/null || true
+  fi
+
+  [ -x "$OLD_MTP_INIT" ] && "$OLD_MTP_INIT" stop 2>/dev/null || true
+
+  rm -rf "$OLD_MTP_DIR"
+  rm -f "$OLD_MTP_INIT"
+
+  info "旧版 mtproxy-go 相关目录和脚本已删除（如果存在的话）。"
 }
 
 restart_mtg() {
-  if ! [ -f "$MTG_CONF" ] || ! [ -x "$MTG_BIN" ]; then
-    error "未检测到已安装的 mtg。"
-    exit 1
+  if [ ! -f "$MTG_CONF" ] || [ ! -x "$MTG_BIN" ]; then
+    error "未检测到已安装的 mtg（缺少 $MTG_BIN 或 $MTG_CONF）。"
+    return 1
   fi
 
   if command -v systemctl >/dev/null 2>&1; then
     systemctl restart mtg 2>/dev/null || {
       error "systemd 重启失败，请检查日志。"
-      exit 1
+      return 1
     }
     info "已通过 systemd 重启 mtg 服务。"
   else
-    warn "系统没有 systemd，请手动重启，例如："
-    echo "  killall mtg  # 结束旧进程（如果有）"
-    echo "  $MTG_BIN run $MTG_CONF &"
+    warn "系统没有 systemd，将尝试先杀掉旧 mtg 再后台启动。"
+    pkill -x mtg 2>/dev/null || true
+    nohup "$MTG_BIN" run "$MTG_CONF" >/dev/null 2>&1 &
+    info "已尝试在后台重启 mtg（无 systemd 模式）。"
   fi
 }
 
 view_log() {
   if command -v systemctl >/dev/null 2>&1; then
     echo
-    warn "显示最近 200 行日志（完整日志可用：journalctl -u mtg -e）"
+    warn "显示 mtg 服务最近 200 行日志："
     echo
-    journalctl -u mtg -e --no-pager | tail -n 200
+    journalctl -u mtg -e --no-pager 2>/dev/null | tail -n 200 || echo "暂无 mtg 日志或未使用 systemd 运行。"
     echo
     warn "持续跟踪请执行：journalctl -u mtg -f"
   else
-    warn "当前系统没有 systemd，日志就是你手动运行 mtg 时终端里的输出。"
+    warn "当前系统没有 systemd，若你是手动运行 mtg，则日志就是当时终端输出。"
+  fi
+
+  if [ -f "$OLD_MTP_DIR/mtproxy.log" ]; then
+    echo
+    warn "检测到旧版 mtproxy-go 日志：$OLD_MTP_DIR/mtproxy.log，显示最近 50 行："
+    tail -n 50 "$OLD_MTP_DIR/mtproxy.log"
   fi
 }
 
@@ -299,6 +329,32 @@ install_all() {
   show_info
 }
 
+is_new_installed() {
+  [ -x "$MTG_BIN" ] || [ -f "$MTG_CONF" ] || [ -f "$MTG_SERVICE" ]
+}
+
+is_new_running() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl is-active --quiet mtg 2>/dev/null
+  else
+    pgrep -x mtg >/dev/null 2>&1
+  fi
+}
+
+is_old_installed() {
+  [ -x "$OLD_MTP_BIN" ] || [ -f "$OLD_MTP_INIT" ]
+}
+
+is_old_running() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl is-active --quiet mtproxy-go 2>/dev/null
+  elif [ -x "$OLD_MTP_INIT" ]; then
+    "$OLD_MTP_INIT" status >/dev/null 2>&1
+  else
+    pgrep -f "/usr/local/mtproxy-go/mtg" >/dev/null 2>&1
+  fi
+}
+
 show_help() {
   cat <<EOF
 用法：bash $(basename "$0") [命令]
@@ -307,8 +363,9 @@ show_help() {
   install    安装并配置 mtg（推荐）
   info       显示当前连接信息（tg:// 链接等）
   restart    重启 mtg 服务
-  log        查看运行日志（systemd）
-  uninstall  卸载 mtg 及配置/服务
+  log        查看运行日志（包含旧 mtproxy-go 日志探测）
+  uninstall  卸载通过本脚本安装的 mtg
+  uninstall-old  卸载旧版 Toyo mtproxy-go
   help       显示本帮助
 
 不加参数直接运行，会进入交互式菜单。
@@ -320,14 +377,37 @@ show_menu() {
     clear
     echo -e "  ${green}MTG NAT 一键脚本${plain}"
     echo "  ----------------------------"
+
+    if is_new_installed; then
+      if is_new_running; then
+        echo -e "  新版 mtg 状态：${green}已安装 / 正在运行${plain}"
+      else
+        echo -e "  新版 mtg 状态：${green}已安装${plain} / ${red}未运行${plain}"
+      fi
+    else
+      echo -e "  新版 mtg 状态：${red}未安装${plain}"
+    fi
+
+    if is_old_installed; then
+      if is_old_running; then
+        echo -e "  旧版 mtproxy-go 状态：${yellow}已检测到 / 正在运行${plain}"
+      else
+        echo -e "  旧版 mtproxy-go 状态：${yellow}已检测到${plain} / ${red}未运行${plain}"
+      fi
+    else
+      echo -e "  旧版 mtproxy-go 状态：未检测到"
+    fi
+
+    echo "  ----------------------------"
     echo -e "  ${green}1.${plain} 安装 / 重新安装 mtg"
     echo -e "  ${green}2.${plain} 查看账号信息"
-    echo -e "  ${green}3.${plain} 重启服务"
+    echo -e "  ${green}3.${plain} 重启 mtg 服务"
     echo -e "  ${green}4.${plain} 查看运行日志"
-    echo -e "  ${green}5.${plain} 卸载 mtg"
+    echo -e "  ${green}5.${plain} 卸载 mtg（本脚本安装的）"
+    echo -e "  ${green}6.${plain} 卸载旧版 mtproxy-go（Toyo 脚本）"
     echo -e "  ${green}0.${plain} 退出"
     echo
-    read -rp "  请输入数字 [0-5]: " choice
+    read -rp "  请输入数字 [0-6]: " choice
 
     case "$choice" in
       1)
@@ -348,6 +428,10 @@ show_menu() {
         ;;
       5)
         uninstall_mtg
+        read -rp "按回车键返回菜单..." _
+        ;;
+      6)
+        uninstall_old_mtproxy
         read -rp "按回车键返回菜单..." _
         ;;
       0)
@@ -378,6 +462,9 @@ main() {
     uninstall)
       uninstall_mtg
       ;;
+    uninstall-old)
+      uninstall_old_mtproxy
+      ;;
     help)
       show_help
       ;;
@@ -393,4 +480,3 @@ main() {
 }
 
 main "$@"
-
